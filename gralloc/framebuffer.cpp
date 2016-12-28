@@ -40,6 +40,11 @@
 #endif
 
 #include "gralloc_priv.h"
+#include "gralloc_vsync.h"
+
+inline size_t roundUpToPageSize(size_t x) {
+    return (x + (PAGE_SIZE-1)) & ~(PAGE_SIZE-1);
+}
 
 /*****************************************************************************/
 
@@ -58,6 +63,35 @@ struct fb_context_t {
 };
 
 /*****************************************************************************/
+
+/*
+ * Copy buffer to the front if page flip is not available/allowed because of
+ * size constraints.
+ */
+inline void memcpy_buffer(private_module_t* m, buffer_handle_t &buffer) {
+    void* fb_vaddr;
+    void* buffer_vaddr;
+
+    m->base.lock(&m->base, m->framebuffer, GRALLOC_USAGE_SW_WRITE_RARELY,
+                 0, 0, m->info.xres, m->info.yres, &fb_vaddr);
+
+    m->base.lock(&m->base, buffer, GRALLOC_USAGE_SW_READ_RARELY,
+                 0, 0, m->info.xres, m->info.yres, &buffer_vaddr);
+
+    // Do a direct copy.
+    // TODO: Implement a copybit HAL for this
+    memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
+    m->base.unlock(&m->base, buffer);
+    m->base.unlock(&m->base, m->framebuffer);
+}
+
+/*****************************************************************************/
+
+/*
+ * Keep track of the vsync state to avoid making excessive ioctl calls.
+ * States: -1 --> unknown; 0 --> disabled; 1 --> enabled.
+ */
+static int vsync_state = -1;
 
 static int fb_setSwapInterval(struct framebuffer_device_t* dev,
                               int interval)
@@ -191,12 +225,14 @@ int init_fb(struct private_module_t* module)
     struct fb_fix_screeninfo finfo;
     if (ioctl(fd, FBIOGET_FSCREENINFO, &finfo) == -1) {
         ALOGE("Fail to get FB Screen Info");
+        close(fd);
         return -errno;
     }
 
     struct fb_var_screeninfo info;
     if (ioctl(fd, FBIOGET_VSCREENINFO, &info) == -1) {
         ALOGE("First, Fail to get FB VScreen Info");
+        close(fd);
         return -errno;
     }
 
@@ -233,10 +269,11 @@ int init_fb(struct private_module_t* module)
         );
 
     if (refreshRate == 0)
-        refreshRate = 60;  /* 60 Hz */
+        refreshRate = 60*1000;  /* 60 Hz */
 
-    float xdpi = (module->xres * 25.4f) / info.width;
-    float ydpi = (module->yres * 25.4f) / info.height;
+    float xdpi = (info.xres * 25.4f) / info.width;
+    float ydpi = (info.yres * 25.4f) / info.height;
+    float fps  = refreshRate / 1000.0f;
 
     ALOGI("using (id=%s)\n"
           "xres         = %d px\n"
@@ -244,10 +281,12 @@ int init_fb(struct private_module_t* module)
           "width        = %d mm (%f dpi)\n"
           "height       = %d mm (%f dpi)\n"
           "refresh rate = %.2f Hz\n",
-          finfo.id, module->xres, module->yres, info.width,  xdpi, info.height,
-          ydpi, (float)refreshRate);
+          finfo.id, info.xres, info.yres, info.width,  xdpi, info.height, ydpi,
+          fps);
 
-    module->line_length = module->xres * 4;
+    module->xres = info.xres;
+    module->yres = info.yres;
+    module->line_length = info.xres;
     module->xdpi = xdpi;
     module->ydpi = ydpi;
     module->fps = fps;
@@ -272,7 +311,7 @@ int init_fb(struct private_module_t* module)
     return 0;
 }
 
-int compositionComplete(struct framebuffer_device_t* dev)
+static int fb_compositionComplete(struct framebuffer_device_t* dev)
 {
     /* By doing a finish here we force the GL driver to start rendering
      all the drawcalls up to this point, and to wait for the rendering to be complete.*/
@@ -334,10 +373,10 @@ int fb_device_open(hw_module_t const* module, const char* name,
     dev->common.version = 0;
     dev->common.module = const_cast<hw_module_t*>(module);
     dev->common.close = fb_close;
-    dev->setSwapInterval = 0;
+    dev->setSwapInterval = fb_setSwapInterval;
     dev->post = fb_post;
     dev->setUpdateRect = 0;
-    dev->compositionComplete = 0;
+    dev->compositionComplete = fb_compositionComplete;
     m->queue = new hwc_callback_queue_t;
     pthread_mutex_init(&m->queue_lock, NULL);
 
