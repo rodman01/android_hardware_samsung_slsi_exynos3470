@@ -43,10 +43,9 @@
 
 /*****************************************************************************/
 
-// numbers of buffers for page flipping
-#define NUM_BUFFERS 2
+#define PAGE_FLIP 0x00000001
 
-struct hwc_callback_entry 
+struct hwc_callback_entry
 {
     void (*callback)(void *, private_handle_t *);
     void *data;
@@ -63,10 +62,25 @@ struct fb_context_t {
 static int fb_setSwapInterval(struct framebuffer_device_t* dev,
                               int interval)
 {
-    fb_context_t* ctx = (fb_context_t*)dev;
-    if (interval < dev->minSwapInterval || interval > dev->maxSwapInterval)
-        return -EINVAL;
-    // FIXME: implement fb_setSwapInterval
+    if (interval < dev->minSwapInterval) {
+        interval = dev->minSwapInterval;
+    } else if (interval > dev->maxSwapInterval) {
+        interval = dev->maxSwapInterval;
+    }
+
+    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+    m->swapInterval = interval;
+
+    if (interval == 0 && vsync_state != 0) {
+        gralloc_vsync_disable(dev);
+        vsync_state = 0;
+    } else if (vsync_state != 1) {
+        gralloc_vsync_enable(dev);
+        vsync_state = 1;
+    }
+
+    ALOGV("%s: vsync state is: %d", __func__, vsync_state);
+
     return 0;
 }
 
@@ -78,16 +92,22 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
     private_handle_t const* hnd = reinterpret_cast<private_handle_t const*>(buffer);
     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
 
-    hwc_callback_queue_t *queue = reinterpret_cast<hwc_callback_queue_t *>(m->queue);
-    pthread_mutex_lock(&m->queue_lock);
-    if(queue->isEmpty())
-        pthread_mutex_unlock(&m->queue_lock);
-    else {
-        private_handle_t *hnd = private_handle_t::dynamicCast(buffer);
-        struct hwc_callback_entry entry = queue->top();
-        queue->pop();
-        pthread_mutex_unlock(&m->queue_lock);
-        entry.callback(entry.data, hnd);
+    if (m->flags & PAGE_FLIP) {
+        hwc_callback_queue_t *queue = reinterpret_cast<hwc_callback_queue_t *>(m->queue);
+        pthread_mutex_lock(&m->queue_lock);
+        if(queue->isEmpty())
+            pthread_mutex_unlock(&m->queue_lock);
+        else {
+            private_handle_t *hnd = private_handle_t::dynamicCast(buffer);
+            struct hwc_callback_entry entry = queue->top();
+            queue->pop();
+            pthread_mutex_unlock(&m->queue_lock);
+            entry.callback(entry.data, hnd);
+        }
+    } else {
+        // If we can't do the page_flip, just copy the buffer to the front
+        // FIXME: use copybit HAL instead of memcpy
+        memcpy_buffer(m, buffer);
     }
 
     return 0;
@@ -160,7 +180,7 @@ int init_fb(struct private_module_t* module)
 
     int fd = -1;
     int i = 0;
-    char name[64];
+    uint32_t flags = PAGE_FLIP;
 
     fd = open("/dev/graphics/fb0", O_RDWR);
     if (fd < 0) {
@@ -180,8 +200,38 @@ int init_fb(struct private_module_t* module)
         return -errno;
     }
 
-    int32_t refreshRate;
-    get_screen_res("fb0", &module->xres, &module->yres, &refreshRate);
+    /*
+     * Request NUM_BUFFERS screens (at lest 2 for page flipping)
+     */
+    int buf_size = roundUpToPageSize(info.yres * info.xres * (info.bits_per_pixel / 8));
+    int numberOfBuffers = (int)(finfo.smem_len / buf_size);
+    ALOGV("Number of supported framebuffers in kernel: %d", numberOfBuffers);
+
+    info.yres_virtual = info.yres * numberOfBuffers;
+
+    if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1)
+    {
+        info.yres_virtual = info.yres;
+        flags &= ~PAGE_FLIP;
+        ALOGW("FBIOPUT_VSCREENINFO failed, page flipping not supported fd: %d", fd );
+    }
+
+    if (info.yres_virtual < info.yres * 2)
+    {
+        // we need at least 2 for page-flipping
+        info.yres_virtual = info.yres;
+        flags &= ~PAGE_FLIP;
+        ALOGW("page flipping not supported (yres_virtual=%d, requested=%d)",
+              info.yres_virtual, info.yres*2 );
+    }
+
+    int refreshRate = 1000000000000000LLU /
+        (
+         uint64_t( info.upper_margin + info.lower_margin + info.vsync_len + info.yres )
+         * ( info.left_margin  + info.right_margin + info.hsync_len + info.xres )
+         * info.pixclock
+        );
+
     if (refreshRate == 0)
         refreshRate = 60;  /* 60 Hz */
 
@@ -200,7 +250,43 @@ int init_fb(struct private_module_t* module)
     module->line_length = module->xres * 4;
     module->xdpi = xdpi;
     module->ydpi = ydpi;
-    module->fps = (float)refreshRate;
+    module->fps = fps;
+    module->info = info;
+    module->finfo = finfo;
+    module->flags = flags;
+
+    size_t fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
+    module->framebuffer = new private_handle_t(dup(fd), fbSize, 0);
+
+    void* vaddr = mmap(0, fbSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (vaddr == MAP_FAILED) {
+        ALOGE("Error mapping the framebuffer (%s)", strerror(errno));
+        close(fd);
+        return -errno;
+    }
+    module->framebuffer->base = vaddr;
+    memset(vaddr, 0, fbSize);
+
+    close(fd);
+
+    return 0;
+}
+
+int compositionComplete(struct framebuffer_device_t* dev)
+{
+    /* By doing a finish here we force the GL driver to start rendering
+     all the drawcalls up to this point, and to wait for the rendering to be complete.*/
+    glFinish();
+    /* The rendering of the backbuffer is now completed.
+     When SurfaceFlinger later does a call to eglSwapBuffer(), the swap will be done
+     synchronously in the same thread, and not asynchronoulsy in a background thread later.
+     The SurfaceFlinger requires this behaviour since it releases the lock on all the
+     SourceBuffers (Layers) after the compositionComplete() function returns.
+     However this "bad" behaviour by SurfaceFlinger should not affect performance,
+     since the Applications that render the SourceBuffers (Layers) still get the
+     full renderpipeline using asynchronous rendering. So they perform at maximum speed,
+     and because of their complexity compared to the Surface flinger jobs, the Surface flinger
+     is normally faster even if it does everyhing synchronous and serial.
 
     return 0;
 }
