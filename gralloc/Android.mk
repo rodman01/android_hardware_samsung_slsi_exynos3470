@@ -26,15 +26,11 @@ LOCAL_C_INCLUDES := hardware/samsung_slsi/exynos3470/include
 
 LOCAL_SRC_FILES := 	\
 	gralloc.cpp 	\
-	framebuffer.cpp \
 	mapper.cpp
 	
 LOCAL_MODULE := gralloc.exynos3
 LOCAL_CFLAGS := -DLOG_TAG=\"gralloc\"
 
-ifeq ($(BOARD_USE_BGRA_8888_FB),true)
-LOCAL_CFLAGS += -DUSE_BGRA_8888
-endif
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE_OWNER := samsung_arm
 
